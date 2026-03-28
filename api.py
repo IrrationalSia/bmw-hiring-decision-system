@@ -14,9 +14,12 @@ Start the server
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
+from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -35,6 +38,49 @@ if _api_key:
 else:
     print("[startup] WARNING: ANTHROPIC_API_KEY is not set — /evaluate will fail")
 
+# ── Self-ping ─────────────────────────────────────────────────────────────────
+_PING_INTERVAL = 10 * 60  # 10 minutes in seconds
+
+
+async def _self_ping_loop() -> None:
+    """
+    Hit GET /health every 10 minutes so Render's free tier does not spin down
+    the dyno between requests. Runs as a background asyncio task for the full
+    lifetime of the process.
+    """
+    # Derive the base URL from Render's env var; fall back to localhost for
+    # local development (where keeping-alive is irrelevant but harmless).
+    base_url = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:8000")
+    url = f"{base_url}/health"
+
+    # Wait one full interval before the first ping so we don't hit /health
+    # before the server has finished binding its socket.
+    await asyncio.sleep(_PING_INTERVAL)
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        while True:
+            try:
+                resp = await client.get(url)
+                print(f"[self-ping] GET {url} → {resp.status_code}")
+            except Exception as exc:
+                print(f"[self-ping] failed: {exc}")
+            await asyncio.sleep(_PING_INTERVAL)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(_self_ping_loop())
+    print(f"[lifespan] Self-ping scheduled every {_PING_INTERVAL // 60} minutes")
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="BMW Hiring Decision System",
@@ -43,6 +89,7 @@ app = FastAPI(
         "All candidate data must be synthetic — no real personal data."
     ),
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 # ── Warmup state ──────────────────────────────────────────────────────────────

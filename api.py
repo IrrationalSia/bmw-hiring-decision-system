@@ -3,68 +3,39 @@ BMW Hiring Decision System — FastAPI wrapper.
 
 Endpoints
 ---------
-GET  /health        — liveness check + lightweight module warmup
-GET  /warmup        — pre-loads synthetic data and Anthropic client; returns ready state
-POST /evaluate      — run the full pipeline; accepts custom JD + candidates
-                      or falls back to the built-in synthetic dataset
+GET  /health        — zero-dependency liveness check
+GET  /warmup        — pre-loads pipeline modules and Anthropic client
+POST /evaluate      — run the full 4-agent pipeline
 
 Start the server
 ----------------
   uvicorn api:app --reload --port 8000
-
-Example request (synthetic dataset)
--------------------------------------
-  curl -X POST http://localhost:8000/evaluate
-
-Example request (custom payload)
-----------------------------------
-  curl -X POST http://localhost:8000/evaluate \\
-       -H "Content-Type: application/json" \\
-       -d @payload.json
 """
 
 from __future__ import annotations
 
+import os
 import time
 
-from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from main import run_pipeline
-from data.synthetic_candidates import JOB_DESCRIPTION, CANDIDATES
+# ── .env loading (best-effort — Render injects vars directly) ─────────────────
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass  # python-dotenv not installed or .env absent — env vars already set
 
-load_dotenv()
+# ── Startup: confirm API key is present ───────────────────────────────────────
+_api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+if _api_key:
+    print(f"[startup] ANTHROPIC_API_KEY loaded: {_api_key[:8]}…")
+else:
+    print("[startup] WARNING: ANTHROPIC_API_KEY is not set — /evaluate will fail")
 
-# ── Warmup state ──────────────────────────────────────────────────────────────
-# Tracks whether the Anthropic client and synthetic data have been loaded into
-# memory. Warmup is idempotent — subsequent calls are instant.
-
-_warmed_at: float | None = None
-
-
-def _do_warmup() -> None:
-    """
-    Force-import the Anthropic client and touch the synthetic dataset so both
-    are resident in memory before the first real request arrives.
-    Runs at most once per process lifetime.
-    """
-    global _warmed_at
-    if _warmed_at is not None:
-        return
-
-    # Importing get_client constructs the Anthropic SDK instance (validates the
-    # API key, initialises httpx connection pool) without making a network call.
-    from agents.utils import get_client
-    get_client()
-
-    # Touch the synthetic data to ensure it is deserialised and cached.
-    _ = JOB_DESCRIPTION
-    _ = CANDIDATES
-
-    _warmed_at = time.time()
-
+# ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="BMW Hiring Decision System",
     description=(
@@ -73,6 +44,31 @@ app = FastAPI(
     ),
     version="1.0.0",
 )
+
+# ── Warmup state ──────────────────────────────────────────────────────────────
+_warmed_at: float | None = None
+
+
+def _do_warmup() -> None:
+    """
+    Lazy-import pipeline modules and initialise the Anthropic client.
+    Runs at most once per process — subsequent calls are instant.
+    All imports are inside this function so a missing package cannot
+    crash startup or block /health.
+    """
+    global _warmed_at
+    if _warmed_at is not None:
+        return
+
+    from agents.utils import get_client          # builds httpx connection pool
+    from data.synthetic_candidates import (      # deserialises module-level data
+        JOB_DESCRIPTION, CANDIDATES,
+    )
+    get_client()
+    _ = JOB_DESCRIPTION
+    _ = CANDIDATES
+    _warmed_at = time.time()
+    print(f"[warmup] Pipeline modules loaded at {_warmed_at}")
 
 
 # ── Request / Response models ─────────────────────────────────────────────────
@@ -97,36 +93,27 @@ class EvaluateRequest(BaseModel):
     )
 
 
-class HealthResponse(BaseModel):
-    status: str
-    timestamp: float
-    warmed: bool
-
-
-class WarmupResponse(BaseModel):
-    status: str
-    ready: bool
-    warmed_at: float
-
-
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
-@app.get("/health", response_model=HealthResponse, tags=["ops"])
-def health() -> HealthResponse:
-    """Liveness check. Also triggers a one-time module warmup on first call."""
-    _do_warmup()
-    return HealthResponse(status="ok", timestamp=time.time(), warmed=_warmed_at is not None)
+@app.get("/health", tags=["ops"])
+def health() -> dict:
+    """
+    Zero-dependency liveness check.
+    No agent imports, no API calls, no warmup side-effects.
+    Always returns 200 as long as the process is alive.
+    """
+    return {"status": "ok", "timestamp": time.time()}
 
 
-@app.get("/warmup", response_model=WarmupResponse, tags=["ops"])
-def warmup() -> WarmupResponse:
+@app.get("/warmup", tags=["ops"])
+def warmup() -> dict:
     """
-    Pre-loads the Anthropic client and synthetic dataset into memory.
-    Safe to call repeatedly — warmup runs at most once per process.
-    Use this endpoint to eliminate cold-start latency before a demo or load test.
+    Pre-loads pipeline modules and the Anthropic client into memory.
+    Idempotent — safe to call repeatedly. Use before a demo or load test
+    to eliminate first-request latency.
     """
     _do_warmup()
-    return WarmupResponse(status="warm", ready=True, warmed_at=_warmed_at)
+    return {"status": "warm", "ready": True, "warmed_at": _warmed_at}
 
 
 @app.post("/evaluate", tags=["pipeline"])
@@ -134,17 +121,16 @@ def evaluate(body: EvaluateRequest = EvaluateRequest()) -> JSONResponse:
     """
     Run the 4-agent hiring decision pipeline.
 
-    - If `job_description` and `candidates` are omitted, the built-in
-      synthetic BMW dataset is used (great for demos).
-    - Supply both fields to evaluate your own JD and candidates.
-
-    Returns the full structured output: JD analysis, per-candidate CV scores,
-    scenario re-weightings, and final decisions including fit_score,
-    speed_pressure_score, and urgency_warning.
+    Omit both fields to use the built-in synthetic BMW dataset.
+    Supply both to evaluate a custom JD and candidate set.
 
     **human_override is always null** — the final call stays with the hiring manager.
     """
-    jd   = body.job_description or JOB_DESCRIPTION
+    # Lazy imports — nothing from agents/ or data/ is loaded until this point
+    from main import run_pipeline
+    from data.synthetic_candidates import JOB_DESCRIPTION, CANDIDATES
+
+    jd    = body.job_description or JOB_DESCRIPTION
     cands = (
         [c.model_dump() for c in body.candidates]
         if body.candidates

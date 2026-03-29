@@ -84,6 +84,16 @@ Produce a final hiring decision analysis following this schema exactly:
 
   "scenario_recommendation": "<which BMW scenario this candidate is best suited for and why — 1–2 sentences>",
 
+  "succession_note": "<one sentence — whether this candidate or an internal BMW colleague \
+should be identified for succession into a more senior role, e.g. VP Manufacturing, \
+or whether succession planning should run in parallel with this hire>",
+
+  "development_priorities": [
+    "<onboarding/upskilling priority 1 for first 90 days>",
+    "<onboarding/upskilling priority 2 for first 90 days>",
+    "<onboarding/upskilling priority 3 for first 90 days>"
+  ],
+
   "human_override": null,
   "human_override_prompt": "The final hiring decision rests with the hiring manager. \
 Consider: does the speed_pressure_score change your view? What would you do if the \
@@ -140,7 +150,7 @@ def make_decision(cv_result: dict, scenario_result: dict, jd_analysis: dict) -> 
 
     response = client.messages.create(
         model=MODEL,
-        max_tokens=2000,
+        max_tokens=2500,
         system=_SYSTEM,
         messages=[{"role": "user", "content": prompt}],
     )
